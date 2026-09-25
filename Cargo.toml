@@ -10,6 +10,7 @@ description = "Procedural macro for generating runtime hook system with before/o
 keywords = ["hook", "macro", "aop", "callback", "ffi"]
 categories = ["development-tools", "development-tools::procedural-macro-helpers"]
 readme = "README.md"
+exclude = [".gitignore"]
 
 [lib]
 proc-macro = true
