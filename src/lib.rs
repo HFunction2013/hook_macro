@@ -2,7 +2,7 @@ use proc_macro::TokenStream;
 use quote::quote;
 use syn::LitStr;
 use syn::{
-    FnArg, ItemFn, PatType, ReturnType, Type, parse::Parse, parse::ParseStream, parse_macro_input,
+    parse::Parse, parse::ParseStream, parse_macro_input, FnArg, ItemFn, PatType, ReturnType, Type,
 };
 
 /// 解析 fallback 参数的辅助结构
@@ -15,7 +15,12 @@ struct HookAttr {
 
 impl Parse for HookAttr {
     fn parse(input: ParseStream) -> syn::Result<Self> {
-        let mut attr = HookAttr { fallback: None, suffix: None, prefix: None, mangling: None };
+        let mut attr = HookAttr {
+            fallback: None,
+            suffix: None,
+            prefix: None,
+            mangling: None,
+        };
 
         while !input.is_empty() {
             let name: syn::Ident = input.parse()?;
@@ -38,8 +43,7 @@ impl Parse for HookAttr {
                     return Err(syn::Error::new(
                         name.span(),
                         format!(
-                            "expected `fallback`, `suffix`, `prefix` or `mangling`, got `{}`",
-                            name_str
+                            "expected `fallback`, `suffix`, `prefix` or `mangling`, got `{name_str}`"
                         ),
                     ));
                 }
@@ -66,7 +70,7 @@ fn compute_orig_name(fn_name: &syn::Ident, attr: &HookAttr) -> (String, syn::Ide
         // 使用 prefix + 原名 + suffix
         let prefix = attr.prefix.as_deref().unwrap_or("");
         let suffix = attr.suffix.as_deref().unwrap_or("_impl"); // 默认后缀
-        format!("{}{}{}", prefix, fn_name_str, suffix)
+        format!("{prefix}{fn_name_str}{suffix}")
     };
 
     let orig_name = syn::Ident::new(&orig_name_str, fn_name.span());
@@ -74,6 +78,11 @@ fn compute_orig_name(fn_name: &syn::Ident, attr: &HookAttr) -> (String, syn::Ide
 }
 
 #[proc_macro_attribute]
+/// 注册 hook 宏
+///
+/// # Panics
+///
+/// 如果被标记的函数参数超过 1 个，会 panic。
 pub fn register_hook(attr: TokenStream, item: TokenStream) -> TokenStream {
     let input_fn = parse_macro_input!(item as ItemFn);
 
@@ -94,7 +103,10 @@ pub fn register_hook(attr: TokenStream, item: TokenStream) -> TokenStream {
     let inputs = &input_fn.sig.inputs;
     let param_count = inputs.len();
 
-    assert!(param_count <= 1, "Function with #[register_hook] must have at most one parameter");
+    assert!(
+        param_count <= 1,
+        "Function with #[register_hook] must have at most one parameter"
+    );
 
     let (param_name, param_type, inner_type) = if param_count == 1 {
         match &inputs[0] {
@@ -111,7 +123,7 @@ pub fn register_hook(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                 (Some(name.clone()), Some(ty.as_ref()), Some(inner))
             }
-            _ => (None, None, None),
+            FnArg::Receiver(_) => (None, None, None),
         }
     } else {
         (None, None, None)
@@ -135,7 +147,11 @@ pub fn register_hook(attr: TokenStream, item: TokenStream) -> TokenStream {
     .into()
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::needless_pass_by_value
+)]
 fn generate_hook_system(
     original_fn: &ItemFn,
     impl_fn_name: &syn::Ident,
@@ -162,29 +178,47 @@ fn generate_hook_system(
         wrapper_fn_name.span(),
     );
 
-    let before_hooks_static =
-        syn::Ident::new(&format!("BEFORE_{}_HOOKS", fn_name_upper), wrapper_fn_name.span());
+    let before_hooks_static = syn::Ident::new(
+        &format!("BEFORE_{fn_name_upper}_HOOKS"),
+        wrapper_fn_name.span(),
+    );
     let on_hooks_static =
-        syn::Ident::new(&format!("ON_{}_HOOKS", fn_name_upper), wrapper_fn_name.span());
-    let after_hooks_static =
-        syn::Ident::new(&format!("AFTER_{}_HOOKS", fn_name_upper), wrapper_fn_name.span());
-    let in_flag_static = syn::Ident::new(&format!("IN_{}", fn_name_upper), wrapper_fn_name.span());
+        syn::Ident::new(&format!("ON_{fn_name_upper}_HOOKS"), wrapper_fn_name.span());
+    let after_hooks_static = syn::Ident::new(
+        &format!("AFTER_{fn_name_upper}_HOOKS"),
+        wrapper_fn_name.span(),
+    );
+    let in_flag_static = syn::Ident::new(&format!("IN_{fn_name_upper}"), wrapper_fn_name.span());
 
-    let register_before =
-        syn::Ident::new(&format!("register_before_{}", wrapper_name_str), wrapper_fn_name.span());
-    let register_on =
-        syn::Ident::new(&format!("register_on_{}", wrapper_name_str), wrapper_fn_name.span());
-    let register_after =
-        syn::Ident::new(&format!("register_after_{}", wrapper_name_str), wrapper_fn_name.span());
-    let clear_hooks =
-        syn::Ident::new(&format!("clear_{}_hooks", wrapper_name_str), wrapper_fn_name.span());
+    let register_before = syn::Ident::new(
+        &format!("register_before_{wrapper_name_str}"),
+        wrapper_fn_name.span(),
+    );
+    let register_on = syn::Ident::new(
+        &format!("register_on_{wrapper_name_str}"),
+        wrapper_fn_name.span(),
+    );
+    let register_after = syn::Ident::new(
+        &format!("register_after_{wrapper_name_str}"),
+        wrapper_fn_name.span(),
+    );
+    let clear_hooks = syn::Ident::new(
+        &format!("clear_{wrapper_name_str}_hooks"),
+        wrapper_fn_name.span(),
+    );
 
-    let run_before =
-        syn::Ident::new(&format!("run_before_{}_chain", wrapper_name_str), wrapper_fn_name.span());
-    let run_on =
-        syn::Ident::new(&format!("run_on_{}_chain", wrapper_name_str), wrapper_fn_name.span());
-    let run_after =
-        syn::Ident::new(&format!("run_after_{}_chain", wrapper_name_str), wrapper_fn_name.span());
+    let run_before = syn::Ident::new(
+        &format!("run_before_{wrapper_name_str}_chain"),
+        wrapper_fn_name.span(),
+    );
+    let run_on = syn::Ident::new(
+        &format!("run_on_{wrapper_name_str}_chain"),
+        wrapper_fn_name.span(),
+    );
+    let run_after = syn::Ident::new(
+        &format!("run_after_{wrapper_name_str}_chain"),
+        wrapper_fn_name.span(),
+    );
 
     let fn_block = &original_fn.block;
     let fn_vis = &original_fn.vis;
