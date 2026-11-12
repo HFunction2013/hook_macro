@@ -67,6 +67,21 @@ struct Param {
     ty: Box<Type>,
     /// 剥去一层引用后的内部类型（如 `String`）。
     inner: Box<Type>,
+    /// 是否为 `Out<'_, T>` 出参：不进 hook 链、不克隆，wrapper 直接透传。
+    is_out: bool,
+}
+
+/// 判断类型是否为 `Out<'_, T>`（兼容 `safer_ffi::Out<...>` 全路径写法）。
+fn is_out_type(ty: &Type) -> bool {
+    match ty {
+        Type::Path(path) => path
+            .path
+            .segments
+            .last()
+            .map(|seg| seg.ident == "Out")
+            .unwrap_or(false),
+        _ => false,
+    }
 }
 
 /// 计算原始函数的重命名名称
@@ -101,10 +116,12 @@ fn parse_params(inputs: &syn::punctuated::Punctuated<FnArg, syn::Token![,]>) -> 
                     Type::Reference(type_ref) => type_ref.elem.clone(),
                     other => Box::new(other.clone()),
                 };
+                let is_out = is_out_type(ty);
                 out.push(Param {
                     name,
                     ty: ty.clone(),
                     inner,
+                    is_out,
                 });
             }
             FnArg::Receiver(_) => {}
@@ -234,255 +251,160 @@ fn generate_hook_system(
         quote! { Default::default() }
     };
 
-    let has_param = !params.is_empty();
+    // 分组：业务参数（参与 before/on/after hook 链）与 `Out` 出参（直接透传给实现，
+    // 不克隆、不进 hook 指针链）。
+    let biz: Vec<&Param> = params.iter().filter(|p| !p.is_out).collect();
+    let all_names: Vec<&syn::Ident> = params.iter().map(|p| &p.name).collect();
+    let all_types: Vec<&Type> = params.iter().map(|p| p.ty.as_ref()).collect();
 
-    if has_param {
-        let names: Vec<&syn::Ident> = params.iter().map(|p| &p.name).collect();
-        let types: Vec<&Type> = params.iter().map(|p| p.ty.as_ref()).collect();
-        let inners: Vec<&Type> = params.iter().map(|p| p.inner.as_ref()).collect();
+    let biz_names: Vec<&syn::Ident> = biz.iter().map(|p| &p.name).collect();
+    let biz_inners: Vec<&Type> = biz.iter().map(|p| p.inner.as_ref()).collect();
 
-        let span = wrapper_fn_name.span();
-        // 每个参数对应的本地克隆绑定与各阶段指针。
-        let data_idents: Vec<syn::Ident> = (0..params.len())
-            .map(|i| syn::Ident::new(&format!("__hook_data_{i}"), span))
-            .collect();
-        let bp_idents: Vec<syn::Ident> = (0..params.len())
-            .map(|i| syn::Ident::new(&format!("__hook_bp_{i}"), span))
-            .collect();
-        let op_idents: Vec<syn::Ident> = (0..params.len())
-            .map(|i| syn::Ident::new(&format!("__hook_op_{i}"), span))
-            .collect();
-        let ap_idents: Vec<syn::Ident> = (0..params.len())
-            .map(|i| syn::Ident::new(&format!("__hook_ap_{i}"), span))
-            .collect();
+    let span = wrapper_fn_name.span();
+    let n_biz = biz.len();
+    // 业务参数对应的本地克隆绑定与各阶段指针。
+    let data_idents: Vec<syn::Ident> = (0..n_biz)
+        .map(|i| syn::Ident::new(&format!("__hook_data_{i}"), span))
+        .collect();
+    let bp_idents: Vec<syn::Ident> = (0..n_biz)
+        .map(|i| syn::Ident::new(&format!("__hook_bp_{i}"), span))
+        .collect();
+    let op_idents: Vec<syn::Ident> = (0..n_biz)
+        .map(|i| syn::Ident::new(&format!("__hook_op_{i}"), span))
+        .collect();
+    let ap_idents: Vec<syn::Ident> = (0..n_biz)
+        .map(|i| syn::Ident::new(&format!("__hook_ap_{i}"), span))
+        .collect();
 
-        quote! {
-            #(#fn_attrs)*
-            #fn_vis fn #impl_fn_name(#(#names: #types),*) #original_output #fn_block
+    // 调用原始实现的实参，严格保持参数原顺序：业务参传克隆引用，出参透传绑定名。
+    let mut impl_args: Vec<proc_macro2::TokenStream> = Vec::with_capacity(params.len());
+    let mut bi = 0usize;
+    for p in params {
+        if p.is_out {
+            let name = &p.name;
+            impl_args.push(quote! { #name });
+        } else {
+            let d = &data_idents[bi];
+            impl_args.push(quote! { &#d });
+            bi += 1;
+        }
+    }
 
-            type #before_hook_name = unsafe extern "C" fn(#(*mut #inners),*) -> bool;
-            type #on_hook_name = unsafe extern "C" fn(#(*const #inners),*) -> bool;
-            type #after_hook_name = unsafe extern "C" fn(#(*const #inners),*) -> bool;
+    quote! {
+        #(#fn_attrs)*
+        #fn_vis fn #impl_fn_name(#(#all_names: #all_types),*) #original_output #fn_block
 
-            static #before_hooks_static: LazyLock<Mutex<Vec<#before_hook_name>>> =
-                LazyLock::new(|| Mutex::new(Vec::new()));
-            static #on_hooks_static: LazyLock<Mutex<Vec<#on_hook_name>>> =
-                LazyLock::new(|| Mutex::new(Vec::new()));
-            static #after_hooks_static: LazyLock<Mutex<Vec<#after_hook_name>>> =
-                LazyLock::new(|| Mutex::new(Vec::new()));
+        type #before_hook_name = unsafe extern "C" fn(#(*mut #biz_inners),*) -> bool;
+        type #on_hook_name = unsafe extern "C" fn(#(*const #biz_inners),*) -> bool;
+        type #after_hook_name = unsafe extern "C" fn(#(*const #biz_inners),*) -> bool;
 
-            static #in_flag_static: AtomicBool = AtomicBool::new(false);
+        static #before_hooks_static: LazyLock<Mutex<Vec<#before_hook_name>>> =
+            LazyLock::new(|| Mutex::new(Vec::new()));
+        static #on_hooks_static: LazyLock<Mutex<Vec<#on_hook_name>>> =
+            LazyLock::new(|| Mutex::new(Vec::new()));
+        static #after_hooks_static: LazyLock<Mutex<Vec<#after_hook_name>>> =
+            LazyLock::new(|| Mutex::new(Vec::new()));
 
-            #[ffi_export]
-            pub fn #register_before(hook: #before_hook_name) {
-                if let Ok(mut hooks) = #before_hooks_static.lock() {
-                    hooks.push(hook);
-                }
-            }
+        static #in_flag_static: AtomicBool = AtomicBool::new(false);
 
-            #[ffi_export]
-            pub fn #register_on(hook: #on_hook_name) {
-                if let Ok(mut hooks) = #on_hooks_static.lock() {
-                    hooks.push(hook);
-                }
-            }
-
-            #[ffi_export]
-            pub fn #register_after(hook: #after_hook_name) {
-                if let Ok(mut hooks) = #after_hooks_static.lock() {
-                    hooks.push(hook);
-                }
-            }
-
-            #[ffi_export]
-            pub fn #clear_hooks() {
-                let _ = #before_hooks_static.lock().map(|mut h| h.clear());
-                let _ = #on_hooks_static.lock().map(|mut h| h.clear());
-                let _ = #after_hooks_static.lock().map(|mut h| h.clear());
-            }
-
-            unsafe fn #run_before(#(#bp_idents: *mut #inners),*) -> bool {
-                if let Ok(list) = #before_hooks_static.lock() {
-                    for h in list.iter() {
-                        unsafe {
-                            if h(#(#bp_idents),*) {
-                                return true;
-                            }
-                        }
-                    }
-                }
-                false
-            }
-
-            unsafe fn #run_on(#(#op_idents: *const #inners),*) -> bool {
-                if let Ok(list) = #on_hooks_static.lock() {
-                    for h in list.iter() {
-                        unsafe {
-                            if h(#(#op_idents),*) {
-                                return true;
-                            }
-                        }
-                    }
-                }
-                false
-            }
-
-            unsafe fn #run_after(#(#ap_idents: *const #inners),*) -> bool {
-                if let Ok(list) = #after_hooks_static.lock() {
-                    for h in list.iter() {
-                        unsafe {
-                            if h(#(#ap_idents),*) {
-                                return true;
-                            }
-                        }
-                    }
-                }
-                false
-            }
-
-            #[ffi_export]
-            pub unsafe fn #wrapper_fn_name(#(#names: #types),*) #original_output {
-                let reenter = #in_flag_static.load(Ordering::SeqCst);
-                if reenter {
-                    return #impl_fn_name(#(#names),*);
-                }
-                #in_flag_static.store(true, Ordering::SeqCst);
-
-                // 为每个参数克隆一份数据，BeforeHook 可以修改这些克隆
-                #( let mut #data_idents = (#names).clone(); )*
-                #( let #bp_idents: *mut #inners = &mut #data_idents; )*
-
-                let mut interrupted = unsafe { #run_before(#(#bp_idents),*) };
-
-                if !interrupted {
-                    #( let #op_idents: *const #inners = &#data_idents; )*
-                    interrupted = unsafe { #run_on(#(#op_idents),*) };
-                }
-
-                let result = if !interrupted {
-                    #( let #ap_idents: *const #inners = &#data_idents; )*
-                    // 原始函数也接收修改后的数据
-                    let res = #impl_fn_name(#(&#data_idents),*);
-                    unsafe { #run_after(#(#ap_idents),*) };
-                    res
-                } else {
-                    #default_result
-                };
-
-                #in_flag_static.store(false, Ordering::SeqCst);
-                result
+        #[ffi_export]
+        pub fn #register_before(hook: #before_hook_name) {
+            if let Ok(mut hooks) = #before_hooks_static.lock() {
+                hooks.push(hook);
             }
         }
-    } else {
-        quote! {
-            #(#fn_attrs)*
-            #fn_vis fn #impl_fn_name() #original_output #fn_block
 
-            type #before_hook_name = unsafe extern "C" fn() -> bool;
-            type #on_hook_name = unsafe extern "C" fn() -> bool;
-            type #after_hook_name = unsafe extern "C" fn() -> bool;
-
-            static #before_hooks_static: LazyLock<Mutex<Vec<#before_hook_name>>> =
-                LazyLock::new(|| Mutex::new(Vec::new()));
-            static #on_hooks_static: LazyLock<Mutex<Vec<#on_hook_name>>> =
-                LazyLock::new(|| Mutex::new(Vec::new()));
-            static #after_hooks_static: LazyLock<Mutex<Vec<#after_hook_name>>> =
-                LazyLock::new(|| Mutex::new(Vec::new()));
-
-            static #in_flag_static: AtomicBool = AtomicBool::new(false);
-
-            #[ffi_export]
-            pub fn #register_before(hook: #before_hook_name) {
-                if let Ok(mut hooks) = #before_hooks_static.lock() {
-                    hooks.push(hook);
-                }
+        #[ffi_export]
+        pub fn #register_on(hook: #on_hook_name) {
+            if let Ok(mut hooks) = #on_hooks_static.lock() {
+                hooks.push(hook);
             }
+        }
 
-            #[ffi_export]
-            pub fn #register_on(hook: #on_hook_name) {
-                if let Ok(mut hooks) = #on_hooks_static.lock() {
-                    hooks.push(hook);
-                }
+        #[ffi_export]
+        pub fn #register_after(hook: #after_hook_name) {
+            if let Ok(mut hooks) = #after_hooks_static.lock() {
+                hooks.push(hook);
             }
+        }
 
-            #[ffi_export]
-            pub fn #register_after(hook: #after_hook_name) {
-                if let Ok(mut hooks) = #after_hooks_static.lock() {
-                    hooks.push(hook);
-                }
-            }
+        #[ffi_export]
+        pub fn #clear_hooks() {
+            let _ = #before_hooks_static.lock().map(|mut h| h.clear());
+            let _ = #on_hooks_static.lock().map(|mut h| h.clear());
+            let _ = #after_hooks_static.lock().map(|mut h| h.clear());
+        }
 
-            #[ffi_export]
-            pub fn #clear_hooks() {
-                let _ = #before_hooks_static.lock().map(|mut h| h.clear());
-                let _ = #on_hooks_static.lock().map(|mut h| h.clear());
-                let _ = #after_hooks_static.lock().map(|mut h| h.clear());
-            }
-
-            unsafe fn #run_before() -> bool {
-                if let Ok(list) = #before_hooks_static.lock() {
-                    for h in list.iter() {
-                        unsafe {
-                            if h() {
-                                return true;
-                            }
+        unsafe fn #run_before(#(#bp_idents: *mut #biz_inners),*) -> bool {
+            if let Ok(list) = #before_hooks_static.lock() {
+                for h in list.iter() {
+                    unsafe {
+                        if h(#(#bp_idents),*) {
+                            return true;
                         }
                     }
                 }
-                false
             }
+            false
+        }
 
-            unsafe fn #run_on() -> bool {
-                if let Ok(list) = #on_hooks_static.lock() {
-                    for h in list.iter() {
-                        unsafe {
-                            if h() {
-                                return true;
-                            }
+        unsafe fn #run_on(#(#op_idents: *const #biz_inners),*) -> bool {
+            if let Ok(list) = #on_hooks_static.lock() {
+                for h in list.iter() {
+                    unsafe {
+                        if h(#(#op_idents),*) {
+                            return true;
                         }
                     }
                 }
-                false
             }
+            false
+        }
 
-            unsafe fn #run_after() -> bool {
-                if let Ok(list) = #after_hooks_static.lock() {
-                    for h in list.iter() {
-                        unsafe {
-                            if h() {
-                                return true;
-                            }
+        unsafe fn #run_after(#(#ap_idents: *const #biz_inners),*) -> bool {
+            if let Ok(list) = #after_hooks_static.lock() {
+                for h in list.iter() {
+                    unsafe {
+                        if h(#(#ap_idents),*) {
+                            return true;
                         }
                     }
                 }
-                false
+            }
+            false
+        }
+
+        #[ffi_export]
+        pub unsafe fn #wrapper_fn_name(#(#all_names: #all_types),*) #original_output {
+            let reenter = #in_flag_static.load(Ordering::SeqCst);
+            if reenter {
+                return #impl_fn_name(#(#all_names),*);
+            }
+            #in_flag_static.store(true, Ordering::SeqCst);
+
+            // 为每个业务参数克隆一份数据，BeforeHook 可以修改这些克隆；出参不克隆。
+            #( let mut #data_idents = (#biz_names).clone(); )*
+            #( let #bp_idents: *mut #biz_inners = &mut #data_idents; )*
+
+            let mut interrupted = unsafe { #run_before(#(#bp_idents),*) };
+
+            if !interrupted {
+                #( let #op_idents: *const #biz_inners = &#data_idents; )*
+                interrupted = unsafe { #run_on(#(#op_idents),*) };
             }
 
-            #[ffi_export]
-            pub unsafe fn #wrapper_fn_name() #original_output {
-                let reenter = #in_flag_static.load(Ordering::SeqCst);
-                if reenter {
-                    return #impl_fn_name();
-                }
-                #in_flag_static.store(true, Ordering::SeqCst);
+            let result = if !interrupted {
+                #( let #ap_idents: *const #biz_inners = &#data_idents; )*
+                // 原始函数接收修改后的业务克隆与透传的出参。
+                let res = #impl_fn_name(#(#impl_args),*);
+                unsafe { #run_after(#(#ap_idents),*) };
+                res
+            } else {
+                #default_result
+            };
 
-                let mut interrupted = unsafe { #run_before() };
-
-                if !interrupted {
-                    interrupted = unsafe { #run_on() };
-                }
-
-                let result = if !interrupted {
-                    let res = #impl_fn_name();
-                    unsafe { #run_after() };
-                    res
-                } else {
-                    #default_result
-                };
-
-                #in_flag_static.store(false, Ordering::SeqCst);
-                result
-            }
+            #in_flag_static.store(false, Ordering::SeqCst);
+            result
         }
     }
 }

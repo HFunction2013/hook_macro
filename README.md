@@ -21,7 +21,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-hook_macro = "0.2"
+hook_macro = "0.3"
 ```
 
 ## Quick Start
@@ -75,6 +75,23 @@ fn main() {
     // the chain and the wrapper returns the fallback value.
     let result = unsafe { divide(&10, &2) };
     assert_eq!(result, 5);
+}
+```
+
+### Out Output Parameters
+
+A parameter whose type is `Out<'_, T>` (an FFI out-pointer, e.g. from
+`safer-ffi`) is treated specially: it is **not** cloned, **not** added to the
+hook chain, and forwarded verbatim to the original implementation. Only the
+remaining business parameters participate in before/on/after hooks.
+
+```rust
+use hook_macro::register_hook;
+use safer_ffi::prelude::*;
+
+#[register_hook]
+fn add(a: &i32, out: Out<'_, i32>) {
+    out.write(a + 10);
 }
 ```
 
@@ -153,7 +170,7 @@ Return `true` from a hook to interrupt the chain and stop execution.
 ## Limitations
 
 - Functions may have any number of parameters (zero, one, or many)
-- Each parameter type must implement `Clone`
+- Business parameters must implement `Clone`; `Out<'_, T>` output parameters are exempt and are passed through untouched
 - Return type must implement `Default` (unless `fallback` is specified)
 
 ## License
