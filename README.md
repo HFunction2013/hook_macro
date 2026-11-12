@@ -3,7 +3,7 @@
 [![crates.io](https://img.shields.io/crates/v/hook_macro.svg)](https://crates.io/crates/hook_macro)
 [![docs.rs](https://docs.rs/hook_macro/badge.svg)](https://docs.rs/hook_macro)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org)
+[![rust](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](https://www.rust-lang.org)
 
 Procedural macro for generating runtime hook systems with before/on/after callbacks.
 
@@ -21,7 +21,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-hook_macro = "0.1"
+hook_macro = "0.2"
 ```
 
 ## Quick Start
@@ -30,51 +30,51 @@ hook_macro = "0.1"
 use hook_macro::register_hook;
 
 #[register_hook]
-fn add_one(x: i32) -> i32 {
+fn add_one(x: &i32) -> i32 {
     x + 1
 }
 
 fn main() {
     // Register hooks
     register_before_add_one(|x| {
-        println!("Before: {}", x);
+        println!("Before: {}", unsafe { &*x });
         false // Return true to interrupt execution
     });
 
     register_on_add_one(|x| {
-        println!("On: {}", x);
+        println!("On: {}", unsafe { &*x });
         false
     });
 
     register_after_add_one(|x| {
-        println!("After: {}", x);
+        println!("After: {}", unsafe { &*x });
         false
     });
 
     // Call the wrapped function
-    let result = unsafe { add_one(5) };
+    let result = unsafe { add_one(&5) };
     println!("Result: {}", result);
 }
 ```
 
 ## Examples
 
-### With Fallback
+### Multiple Parameters
 
 ```rust
 use hook_macro::register_hook;
 
 #[register_hook(fallback = "0")]
-fn divide(a: i32, b: i32) -> i32 {
+fn divide(a: &i32, b: &i32) -> i32 {
     a / b
 }
 
 fn main() {
-    // Interrupt the call and return fallback value
-    register_before_divide(|_| true); // Always interrupt
-
-    let result = unsafe { divide(10, 2) };
-    assert_eq!(result, 0); // Returns fallback value
+    // A before hook can mutate each cloned argument; the mutated clones are
+    // forwarded to the original implementation. Returning `true` interrupts
+    // the chain and the wrapper returns the fallback value.
+    let result = unsafe { divide(&10, &2) };
+    assert_eq!(result, 5);
 }
 ```
 
@@ -85,19 +85,19 @@ use hook_macro::register_hook;
 
 // Rename the original implementation
 #[register_hook(suffix = "_original")]
-fn my_function(x: i32) -> i32 {
+fn my_function(x: &i32) -> i32 {
     x * 2
 }
 
 // Or use custom prefix
 #[register_hook(prefix = "impl_")]
-fn another_function(x: i32) -> i32 {
+fn another_function(x: &i32) -> i32 {
     x + 1
 }
 
 // Or fully control the name
 #[register_hook(mangling = "custom_impl_name")]
-fn third_function(x: i32) -> i32 {
+fn third_function(x: &i32) -> i32 {
     x - 1
 }
 ```
@@ -115,12 +115,20 @@ For a function `foo` with one parameter, the macro generates:
 
 ### Hook Types
 
-With parameter `T`:
+With one parameter `T`:
 
 ```rust
 type BeforeFooHook = unsafe extern "C" fn(*mut T) -> bool;
 type OnFooHook = unsafe extern "C" fn(*const T) -> bool;
 type AfterFooHook = unsafe extern "C" fn(*const T) -> bool;
+```
+
+With multiple parameters `T1, T2, ...`:
+
+```rust
+type BeforeFooHook = unsafe extern "C" fn(*mut T1, *mut T2, ...) -> bool;
+type OnFooHook = unsafe extern "C" fn(*const T1, *const T2, ...) -> bool;
+type AfterFooHook = unsafe extern "C" fn(*const T1, *const T2, ...) -> bool;
 ```
 
 Without parameters:
@@ -144,8 +152,8 @@ Return `true` from a hook to interrupt the chain and stop execution.
 
 ## Limitations
 
-- Functions can have at most **one parameter**
-- Parameter type must implement `Clone`
+- Functions may have any number of parameters (zero, one, or many)
+- Each parameter type must implement `Clone`
 - Return type must implement `Default` (unless `fallback` is specified)
 
 ## License

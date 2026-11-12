@@ -59,6 +59,16 @@ impl Parse for HookAttr {
     }
 }
 
+/// 被标记函数的一个参数。
+struct Param {
+    /// 参数名（如 `x`）。
+    name: syn::Ident,
+    /// 原始参数类型（如 `&String`）。
+    ty: Box<Type>,
+    /// 剥去一层引用后的内部类型（如 `String`）。
+    inner: Box<Type>,
+}
+
 /// 计算原始函数的重命名名称
 fn compute_orig_name(fn_name: &syn::Ident, attr: &HookAttr) -> (String, syn::Ident) {
     let fn_name_str = fn_name.to_string();
@@ -77,12 +87,37 @@ fn compute_orig_name(fn_name: &syn::Ident, attr: &HookAttr) -> (String, syn::Ide
     (orig_name_str, orig_name)
 }
 
+/// 解析被标记函数的全部参数（忽略 `self` 接收器）。
+fn parse_params(inputs: &syn::punctuated::Punctuated<FnArg, syn::Token![,]>) -> Vec<Param> {
+    let mut out = Vec::new();
+    for arg in inputs {
+        match arg {
+            FnArg::Typed(PatType { pat, ty, .. }) => {
+                let name = match pat.as_ref() {
+                    syn::Pat::Ident(p) => p.ident.clone(),
+                    _ => panic!("Expected simple parameter name"),
+                };
+                let inner: Box<Type> = match ty.as_ref() {
+                    Type::Reference(type_ref) => type_ref.elem.clone(),
+                    other => Box::new(other.clone()),
+                };
+                out.push(Param {
+                    name,
+                    ty: ty.clone(),
+                    inner,
+                });
+            }
+            FnArg::Receiver(_) => {}
+        }
+    }
+    out
+}
+
 #[proc_macro_attribute]
 /// 注册 hook 宏
 ///
-/// # Panics
-///
-/// 如果被标记的函数参数超过 1 个，会 panic。
+/// 支持无参、单参与多参函数。多参时 before hook 接收各参数的可变克隆指针，
+/// on/after hook 接收只读克隆指针。
 pub fn register_hook(attr: TokenStream, item: TokenStream) -> TokenStream {
     let input_fn = parse_macro_input!(item as ItemFn);
 
@@ -100,34 +135,7 @@ pub fn register_hook(attr: TokenStream, item: TokenStream) -> TokenStream {
     let wrapper_name_str = fn_name_str.clone();
     let fn_name_upper = fn_name_str.to_uppercase();
 
-    let inputs = &input_fn.sig.inputs;
-    let param_count = inputs.len();
-
-    assert!(
-        param_count <= 1,
-        "Function with #[register_hook] must have at most one parameter"
-    );
-
-    let (param_name, param_type, inner_type) = if param_count == 1 {
-        match &inputs[0] {
-            FnArg::Typed(PatType { pat, ty, .. }) => {
-                let name = match pat.as_ref() {
-                    syn::Pat::Ident(p) => &p.ident,
-                    _ => panic!("Expected simple parameter name"),
-                };
-
-                let inner = match ty.as_ref() {
-                    Type::Reference(type_ref) => &type_ref.elem,
-                    other => other,
-                };
-
-                (Some(name.clone()), Some(ty.as_ref()), Some(inner))
-            }
-            FnArg::Receiver(_) => (None, None, None),
-        }
-    } else {
-        (None, None, None)
-    };
+    let params = parse_params(&input_fn.sig.inputs);
 
     let original_output = &input_fn.sig.output;
 
@@ -137,11 +145,8 @@ pub fn register_hook(attr: TokenStream, item: TokenStream) -> TokenStream {
         &wrapper_name,
         &wrapper_name_str,
         fn_name_upper,
-        param_name,
-        param_type,
-        inner_type,
+        &params,
         original_output,
-        param_count > 0,
         hook_attr.fallback.as_deref(), // 传入 fallback
     )
     .into()
@@ -158,11 +163,8 @@ fn generate_hook_system(
     wrapper_fn_name: &syn::Ident,
     wrapper_name_str: &str,
     fn_name_upper: String,
-    param_name: Option<syn::Ident>,
-    param_type: Option<&Type>,
-    inner_type: Option<&Type>,
+    params: &[Param],
     original_output: &ReturnType,
-    has_param: bool,
     fallback_expr: Option<&str>,
 ) -> proc_macro2::TokenStream {
     let before_hook_name = syn::Ident::new(
@@ -232,18 +234,35 @@ fn generate_hook_system(
         quote! { Default::default() }
     };
 
+    let has_param = !params.is_empty();
+
     if has_param {
-        let p_name = param_name.as_ref().unwrap();
-        let p_type = param_type.unwrap();
-        let p_inner = inner_type.unwrap();
+        let names: Vec<&syn::Ident> = params.iter().map(|p| &p.name).collect();
+        let types: Vec<&Type> = params.iter().map(|p| p.ty.as_ref()).collect();
+        let inners: Vec<&Type> = params.iter().map(|p| p.inner.as_ref()).collect();
+
+        let span = wrapper_fn_name.span();
+        // 每个参数对应的本地克隆绑定与各阶段指针。
+        let data_idents: Vec<syn::Ident> = (0..params.len())
+            .map(|i| syn::Ident::new(&format!("__hook_data_{i}"), span))
+            .collect();
+        let bp_idents: Vec<syn::Ident> = (0..params.len())
+            .map(|i| syn::Ident::new(&format!("__hook_bp_{i}"), span))
+            .collect();
+        let op_idents: Vec<syn::Ident> = (0..params.len())
+            .map(|i| syn::Ident::new(&format!("__hook_op_{i}"), span))
+            .collect();
+        let ap_idents: Vec<syn::Ident> = (0..params.len())
+            .map(|i| syn::Ident::new(&format!("__hook_ap_{i}"), span))
+            .collect();
 
         quote! {
             #(#fn_attrs)*
-            #fn_vis fn #impl_fn_name(#p_name: #p_type) #original_output #fn_block
+            #fn_vis fn #impl_fn_name(#(#names: #types),*) #original_output #fn_block
 
-            type #before_hook_name = unsafe extern "C" fn(*mut #p_inner) -> bool;
-            type #on_hook_name = unsafe extern "C" fn(*const #p_inner) -> bool;
-            type #after_hook_name = unsafe extern "C" fn(*const #p_inner) -> bool;
+            type #before_hook_name = unsafe extern "C" fn(#(*mut #inners),*) -> bool;
+            type #on_hook_name = unsafe extern "C" fn(#(*const #inners),*) -> bool;
+            type #after_hook_name = unsafe extern "C" fn(#(*const #inners),*) -> bool;
 
             static #before_hooks_static: LazyLock<Mutex<Vec<#before_hook_name>>> =
                 LazyLock::new(|| Mutex::new(Vec::new()));
@@ -282,11 +301,11 @@ fn generate_hook_system(
                 let _ = #after_hooks_static.lock().map(|mut h| h.clear());
             }
 
-            unsafe fn #run_before(param: *mut #p_inner) -> bool {
+            unsafe fn #run_before(#(#bp_idents: *mut #inners),*) -> bool {
                 if let Ok(list) = #before_hooks_static.lock() {
                     for h in list.iter() {
                         unsafe {
-                            if h(param) {
+                            if h(#(#bp_idents),*) {
                                 return true;
                             }
                         }
@@ -295,11 +314,11 @@ fn generate_hook_system(
                 false
             }
 
-            unsafe fn #run_on(param: *const #p_inner) -> bool {
+            unsafe fn #run_on(#(#op_idents: *const #inners),*) -> bool {
                 if let Ok(list) = #on_hooks_static.lock() {
                     for h in list.iter() {
                         unsafe {
-                            if h(param) {
+                            if h(#(#op_idents),*) {
                                 return true;
                             }
                         }
@@ -308,11 +327,11 @@ fn generate_hook_system(
                 false
             }
 
-            unsafe fn #run_after(param: *const #p_inner) -> bool {
+            unsafe fn #run_after(#(#ap_idents: *const #inners),*) -> bool {
                 if let Ok(list) = #after_hooks_static.lock() {
                     for h in list.iter() {
                         unsafe {
-                            if h(param) {
+                            if h(#(#ap_idents),*) {
                                 return true;
                             }
                         }
@@ -322,30 +341,29 @@ fn generate_hook_system(
             }
 
             #[ffi_export]
-            pub unsafe fn #wrapper_fn_name(#p_name: #p_type) #original_output {
+            pub unsafe fn #wrapper_fn_name(#(#names: #types),*) #original_output {
                 let reenter = #in_flag_static.load(Ordering::SeqCst);
                 if reenter {
-                    return #impl_fn_name(#p_name);
+                    return #impl_fn_name(#(#names),*);
                 }
                 #in_flag_static.store(true, Ordering::SeqCst);
 
-                // Clone 一份数据，BeforeHook 可以修改这份克隆
-                let mut data = (#p_name).clone();
-                let param_ptr: *mut #p_inner = &mut data;
+                // 为每个参数克隆一份数据，BeforeHook 可以修改这些克隆
+                #( let mut #data_idents = (#names).clone(); )*
+                #( let #bp_idents: *mut #inners = &mut #data_idents; )*
 
-                let mut interrupted = unsafe { #run_before(param_ptr) };
+                let mut interrupted = unsafe { #run_before(#(#bp_idents),*) };
 
                 if !interrupted {
-                    // 用修改后的数据继续往后传
-                    let data_ptr: *const #p_inner = &data;
-                    interrupted = unsafe { #run_on(data_ptr) };
+                    #( let #op_idents: *const #inners = &#data_idents; )*
+                    interrupted = unsafe { #run_on(#(#op_idents),*) };
                 }
 
                 let result = if !interrupted {
+                    #( let #ap_idents: *const #inners = &#data_idents; )*
                     // 原始函数也接收修改后的数据
-                    let res = #impl_fn_name(&data);
-                    let data_ptr: *const #p_inner = &data;
-                    unsafe { #run_after(data_ptr) };
+                    let res = #impl_fn_name(#(&#data_idents),*);
+                    unsafe { #run_after(#(#ap_idents),*) };
                     res
                 } else {
                     #default_result
